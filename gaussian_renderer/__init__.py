@@ -11,7 +11,7 @@
 
 import torch
 import math
-from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer, GaussianRasterizerNew
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
@@ -21,9 +21,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     
     Background tensor (bg_color) must be on GPU!
     """
- 
+
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device=pc.data_device) + 0
     try:
         screenspace_points.retain_grad()
     except:
@@ -47,7 +47,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         prefiltered=False,
         debug=pipe.debug
     )
-
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
     means3D = pc.get_xyz
