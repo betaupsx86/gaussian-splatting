@@ -22,7 +22,7 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from arguments import ModelParams
 
-class GaussianModel(nn.Module):
+class GaussianModel():
 
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
@@ -140,8 +140,6 @@ class GaussianModel(nn.Module):
         features[:, 3:, 1:] = 0.0
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
-        print(fused_point_cloud.device)
-
         dist2 = torch.clamp_min(distCUDA2(fused_point_cloud), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device=self.data_device)
@@ -155,14 +153,12 @@ class GaussianModel(nn.Module):
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=self.data_device)
-        print('===========PCD CREATED RANK========', self.data_device, '===================')     
-
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=self.data_device)
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=self.data_device)
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=self.data_device)
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -313,7 +309,6 @@ class GaussianModel(nn.Module):
         self._rotation = optimizable_tensors["rotation"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
-
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
 

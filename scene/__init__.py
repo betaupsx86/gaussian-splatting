@@ -70,23 +70,21 @@ class Scene:
 
         def split_dataset(total_cameras, rank, world_size):
             cameras_per_rank = total_cameras // world_size
-            start_index = rank * cameras_per_rank
-            end_index = start_index + cameras_per_rank if rank < world_size - 1 else total_cameras
-            return start_index, end_index        
+            remainder = total_cameras % world_size
+            start_index = rank * cameras_per_rank + min(rank, remainder)
+            end_index = start_index + cameras_per_rank + (1 if rank < remainder else 0)
+            return start_index, end_index
         train_start_index, train_end_index = split_dataset(len(scene_info.train_cameras), args.rank, args.world_size)
         test_start_index, test_end_index = split_dataset(len(scene_info.test_cameras), args.rank, args.world_size)
 
         for resolution_scale in resolution_scales:
-            print("Loading Training Cameras")
+            print("Loading Training Cameras Rank: ",args.rank, " Total: ", train_end_index - train_start_index)
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras[train_start_index:train_end_index], resolution_scale, args)
-            print("Loading Test Cameras")
+            print("Loading Test Cameras Rank: ",args.rank, " Total: ", test_end_index - test_start_index)
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras[test_start_index:test_end_index], resolution_scale, args)
 
         if self.loaded_iter:
-            self.gaussians.load_ply(os.path.join(self.model_path,
-                                                           "point_cloud",
-                                                           "iteration_" + str(self.loaded_iter),
-                                                           "point_cloud.ply"))
+            self.gaussians.load_ply(os.path.join(self.model_path, "point_cloud", "iteration_" + str(self.loaded_iter), "point_cloud.ply"))
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 

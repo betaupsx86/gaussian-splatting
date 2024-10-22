@@ -55,52 +55,50 @@ def cleanup():
     dist.destroy_process_group()
 
 def training(rank, world_size, dataset, opt, pipe, test_iterations, save_iterations, checkpoint_iterations, checkpoint, debug_from):
-    setup(rank, world_size)    
+    setup(rank, world_size)
+    test_iterations = [x//world_size for x in test_iterations]
+    save_iterations = [x//world_size for x in save_iterations]
+    checkpoint_iterations = [x//world_size for x in checkpoint_iterations]
+    debug_from//=world_size
+    opt.iterations//=world_size
+    opt.position_lr_max_steps//=world_size
+    opt.densification_interval//=world_size
+    opt.opacity_reset_interval//=world_size
+    opt.densify_from_iter//=world_size
+    opt.densify_until_iter//=world_size
+
     dataset.rank = rank
     dataset.world_size = world_size
     dataset.data_device = "{}:{}".format(dataset.data_device, rank)
 
     first_iter = 0
-    tb_writer = None
-    if rank == 0:
-        tb_writer = prepare_output_and_logger(dataset)
-    gaussians_model = GaussianModel(dataset)
-    scene = Scene(dataset, gaussians_model)
-    print('===========TRAINING SETUP========', rank, '===================')     
-    gaussians_model.training_setup(opt)
-    print('===========TRAINING SETUP END========', rank, '===================')     
+    tb_writer = prepare_output_and_logger(dataset) if rank==0 else None
+    gaussians = GaussianModel(dataset)
+    scene = Scene(dataset, gaussians)
+    gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
-        gaussians_model.restore(model_params, opt)
-    
-    print('===========DDP SETUP========', rank, '===================')
-    gaussians = DDP(gaussians_model.to(dataset.data_device), device_ids=[rank])
-    print('===========DDP SETUP END========', rank, '===================')     
+        gaussians.restore(model_params, opt)    
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
-    background = torch.tensor(bg_color, dtype=torch.float32, device=dataset.data_device)
+    background = torch.tensor(bg_color, dtype=torch.float32, device=gaussians.data_device)
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress") if rank==0 else None
     first_iter += 1
-    shUpdateIter = first_iter // 1000
-    progressUpdateIter = first_iter // 10
-    densifyIter = first_iter // opt.densification_interval
-    opacityResetIter = first_iter // opt.opacity_reset_interval
-    for iteration in range(first_iter, opt.iterations + 1, world_size):
-        print('===========RANK========', rank, '=========iter==========', iteration)     
-        if network_gui.conn == None:
+    for iteration in range(first_iter, opt.iterations + 1):
+        if rank == 0  and network_gui.conn == None:
             network_gui.try_connect()
-        while network_gui.conn != None:
+        while rank == 0 and network_gui.conn != None:
             try:
                 net_image_bytes = None
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
                 if custom_cam != None:
-                    net_image = render(custom_cam, gaussians.module, pipe, background, scaling_modifer)["render"]
+                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
                 if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
@@ -110,12 +108,11 @@ def training(rank, world_size, dataset, opt, pipe, test_iterations, save_iterati
 
         iter_start.record()
 
-        gaussians.module.update_learning_rate(iteration)
+        gaussians.update_learning_rate(iteration)
 
-        # Every 1000 its we increase the levels of SH up to a maximum degree
-        while iteration // 1000 - shUpdateIter > 0:
-            gaussians.module.oneupSHdegree()
-            shUpdateIter += 1
+        # Every 1000 we increase the levels of SH up to a maximum degree
+        if iteration % (1000//world_size) == 0:
+            gaussians.oneupSHdegree()
 
         # Pick a random Camera
         if not viewpoint_stack:
@@ -123,12 +120,12 @@ def training(rank, world_size, dataset, opt, pipe, test_iterations, save_iterati
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
         # Render
-        if (iteration - 1) == debug_from:
+        if rank ==0 and (iteration - 1) == debug_from:
             pipe.debug = True
 
-        bg = torch.rand((3), device=dataset.data_device) if opt.random_background else background
-        render_pkg = render(viewpoint_cam, gaussians.module, pipe, bg)
-        # render_pkg = gaussians.module.render(viewpoint_cam, pipe, bg, render)
+        bg = torch.rand((3), device=gaussians.data_device) if opt.random_background else background
+
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         # Loss
@@ -136,69 +133,74 @@ def training(rank, world_size, dataset, opt, pipe, test_iterations, save_iterati
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         loss.backward()
-
         iter_end.record()
-
+        
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-            while (iteration // 10 - progressUpdateIter) > 0:
+            if rank == 0 and iteration % (10//world_size) == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
-                progress_bar.update(10)
-                progressUpdateIter+=1
-            if iteration >= opt.iterations:
+                progress_bar.update((10//world_size))
+            if rank == 0 and iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
             training_report(rank, world_size, tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), test_iterations, scene, render, (pipe, background))
-            
-            for checkpoint in save_iterations:       
-                print('save checkpoint', abs(iteration - checkpoint), world_size/2)         
-                if (rank == 0 and abs(iteration - checkpoint) <= world_size/2):
-                    print("\n[ITER {}] Saving Gaussians".format(iteration))
-                    scene.save(iteration)
+            if (rank == 0 and iteration in save_iterations):
+                print("\n[ITER {}] Saving Gaussians".format(iteration))
+                scene.save(iteration)
+
+            # Reduce gradients manually for the iteration.
+            # TODO: All reducing all this has awful performance. Accumulate several iterations instead
+            if gaussians._xyz.grad is not None:
+                gaussians._xyz.grad = gaussians._xyz.grad.contiguous()
+                dist.all_reduce(gaussians._xyz.grad, op=dist.ReduceOp.SUM)
+                gaussians._xyz.grad /= world_size               
+            if gaussians._features_dc.grad is not None:
+                gaussians._features_dc.grad = gaussians._features_dc.grad.contiguous()
+                dist.all_reduce(gaussians._features_dc.grad, op=dist.ReduceOp.SUM)
+                gaussians._features_dc.grad /= world_size               
+            if gaussians._features_rest.grad is not None:
+                gaussians._features_rest.grad = gaussians._features_rest.grad.contiguous()
+                dist.all_reduce(gaussians._features_rest.grad, op=dist.ReduceOp.SUM)
+                gaussians._features_rest.grad /= world_size               
+            if gaussians._scaling.grad is not None:
+                gaussians._scaling.grad = gaussians._scaling.grad.contiguous()
+                dist.all_reduce(gaussians._scaling.grad, op=dist.ReduceOp.SUM)
+                gaussians._scaling.grad /= world_size               
+            if gaussians._rotation.grad is not None:
+                gaussians._rotation.grad = gaussians._rotation.grad.contiguous()
+                dist.all_reduce(gaussians._rotation.grad, op=dist.ReduceOp.SUM)
+                gaussians._rotation.grad /= world_size               
+            if gaussians._opacity.grad is not None:
+                gaussians._opacity.grad = gaussians._opacity.grad.contiguous()
+                dist.all_reduce(gaussians._opacity.grad, op=dist.ReduceOp.SUM)
+                gaussians._opacity.grad /= world_size
 
             # Densification
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
-                # len(gaussians.module.max_radii2D); len(visibility_filter)
-                # import pdb;pdb.set_trace()
-                gaussians.module.max_radii2D[visibility_filter] = torch.max(gaussians.module.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.module.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                # These while loops are a bit weird. Only make sense with num gpus greaters than these intervals so they should not happen
-                if dataset.white_background and iteration >= opt.densify_from_iter and densifyIter == 0:
-                    gaussians.module.reset_opacity()
-
-                while iteration > opt.densify_from_iter and iteration // opt.densification_interval - densifyIter > 0:
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    dist.all_reduce(gaussians.xyz_gradient_accum, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(gaussians.denom, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(gaussians.max_radii2D, op=dist.ReduceOp.MAX)
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    # collect vector before densify
-                    dist.all_reduce(gaussians.module.xyz_gradient_accum, op=dist.ReduceOp.SUM)
-                    dist.all_reduce(gaussians.module.denom, op=dist.ReduceOp.SUM)
-                    dist.all_reduce(gaussians.module.max_radii2D, op=dist.ReduceOp.MAX)
-                    gaussians.module.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
-                    densifyIter+=1
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
 
-                    print("Before Memory Summary Rank ", rank)
-                    print(torch.cuda.memory_summary())
-                    torch.cuda.empty_cache()            
-                    print("Memory Summary Rank ", rank)
-                    print(torch.cuda.memory_summary())
-                 
-                while iteration // opt.opacity_reset_interval - opacityResetIter > 0:
-                    gaussians.module.reset_opacity()
-                    opacityResetIter+=1
+                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                    gaussians.reset_opacity()
 
             # Optimizer step
-            # import pdb;pdb.set_trace()
             if iteration < opt.iterations:
-                gaussians.module.optimizer.step()
-                gaussians.module.optimizer.zero_grad(set_to_none = True)
-            
-            for checkpoint in checkpoint_iterations:                
-                if (rank == 0 and abs(iteration - checkpoint) <= world_size/2):
-                    print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                    torch.save((gaussians.module.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                gaussians.optimizer.step()
+                gaussians.optimizer.zero_grad(set_to_none = True)
+
+            if (rank == 0 and iteration in checkpoint_iterations):
+                print("\n[ITER {}] Saving Checkpoint".format(iteration))
+                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -229,75 +231,35 @@ def training_report(rank, world_size, tb_writer, iteration, Ll1, loss, l1_loss, 
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
     # Report test and samples of training set
-    for checkpoint in test_iterations:                
-        if (rank == 0 and abs(iteration - checkpoint) <= world_size/2):
-            torch.cuda.empty_cache()
-            validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                                {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+    if rank == 0 and iteration in test_iterations:
+        torch.cuda.empty_cache()
+        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
+                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
-            for config in validation_configs:
-                if config['cameras'] and len(config['cameras']) > 0:
-                    l1_test = 0.0
-                    psnr_test = 0.0
-                    for idx, viewpoint in enumerate(config['cameras']):
-                        image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
-                        gt_image = torch.clamp(viewpoint.original_image.to("{}:{}".format("cuda", rank)), 0.0, 1.0)
-                        if tb_writer and (idx < 5):
-                            tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                            if iteration == test_iterations[0]:
-                                tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                        l1_test += l1_loss(image, gt_image).mean().double()
-                        psnr_test += psnr(image, gt_image).mean().double()
-                    psnr_test /= len(config['cameras'])
-                    l1_test /= len(config['cameras'])          
-                    print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
-                    if tb_writer:
-                        tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                        tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+        for config in validation_configs:
+            if config['cameras'] and len(config['cameras']) > 0:
+                l1_test = 0.0
+                psnr_test = 0.0
+                for idx, viewpoint in enumerate(config['cameras']):
+                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                    gt_image = torch.clamp(viewpoint.original_image, 0.0, 1.0)
+                    if tb_writer and (idx < 5):
+                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
+                        if iteration == test_iterations[0]:
+                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                    l1_test += l1_loss(image, gt_image).mean().double()
+                    psnr_test += psnr(image, gt_image).mean().double()
+                psnr_test /= len(config['cameras'])
+                l1_test /= len(config['cameras'])          
+                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                if tb_writer:
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
 
-            if tb_writer:
-                tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-                tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
-            torch.cuda.empty_cache()
-
-def training_setup_simple(rank, world_size, dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
-    from torch.utils.data import DataLoader, TensorDataset, DistributedSampler
-   # Simple Model Definition
-    class SimpleModel(nn.Module):
-        def __init__(self, input_size, output_size):
-            super(SimpleModel, self).__init__()
-            self.linear = nn.Linear(input_size, output_size)
-
-        def forward(self, x):
-            return self.linear(x)
-   
-    print('===========TRAINING SETUP========', rank, '===================')     
-   # Setup the process groups
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12345'
-    os.environ['WORLD_SIZE'] = str(world_size)
-    os.environ['RANK'] = str(rank)
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)    
-    model = SimpleModel(10, 1).to(rank)
-    print('===========TRAINING DDP SETUP========', rank, '===================')     
-    ddp_model = DDP(model, device_ids=[rank])
-    dataset = TensorDataset(torch.randn(1000, 10), torch.randn(1000, 1))
-    sampler = DistributedSampler(dataset)
-    dataloader = DataLoader(dataset, batch_size=32, sampler=sampler)
-    criterion = nn.MSELoss()
-    optimizer = optim.SGD(ddp_model.parameters(), lr=0.01)
-    for epoch in range(10):
-        sampler.set_epoch(epoch)  # Set epoch to shuffle data properly
-        for batch, (data, target) in enumerate(dataloader):
-            data, target = data.to(rank), target.to(rank)
-            optimizer.zero_grad()
-            output = ddp_model(data)
-            loss = criterion(output, target)
-            loss.backward()
-            optimizer.step()
-            if batch % 10 == 0 and rank == 0:
-                print(f"Epoch [{epoch}/{10}], Batch [{batch}/{len(dataloader)}], Loss: {loss.item()}")
-    dist.destroy_process_group()
+        if tb_writer:
+            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
+            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+        torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -309,8 +271,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[10, 1_000, 7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[10, 1_000, 7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[100, 7_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[100, 7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
